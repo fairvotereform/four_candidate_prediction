@@ -14,10 +14,6 @@ knitr::opts_chunk$set(echo = TRUE)
 
 This document contains simulations demonstrating the applicability of two methods (one Bayesian and one non-Bayesian bootstrap) for estimating transfer probabilities for two eliminated candidates.
 
-## Setup 
-
-Load libraries and some useful functions.
-
 ```{r message=FALSE, warning=FALSE}
 library(tidyverse)
 library(forcats)
@@ -101,11 +97,11 @@ $$
 Treating the first choices as independent variables we can write regression equations for the three parameters in the categorical
 
 $$
-p_A = first\_choice_{C,i} * \alpha_C + (1 - first\_choice_{C,i})  * \alpha_D
+p_{A,i} = first\_choice_{C,i} * \alpha_C + (1 - first\_choice_{C,i})  * \alpha_D
 \\
-p_B = first\_choice_{C,i} * \beta_C + (1 - first\_choice_{C,i})  * \beta_D
+p_{B,i} = first\_choice_{C,i} * \beta_C + (1 - first\_choice_{C,i})  * \beta_D
 \\
-p_A = first\_choice_{C,i} * \gamma_C + (1 - first\_choice_{C,i})  * \gamma_D
+p_{exhaust,i} = first\_choice_{C,i} * \gamma_C + (1 - first\_choice_{C,i})  * \gamma_D
 \\\\
 {\sf where } ~ first\_choice_{C,i} = 1 {\sf ~ if ~ the ~ voter ~ picked ~ C ~ first, ~ and ~ 0 ~ otherwise.}
 $$
