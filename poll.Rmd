@@ -1,0 +1,532 @@
+---
+title: "4 candidates, 2 eliminated"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float: true
+    code_folding: hide
+---
+
+## Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(forcats)
+library(dplyr)
+library(glue)
+library(brms)
+library(tidybayes)
+library(bayesplot)
+library(cowplot)
+library(janitor)
+
+#rstan_options(auto_write = TRUE)
+#options(mc.cores = parallel::detectCores())
+
+```
+
+```{r}
+
+# helper functions
+multinomial_p <- function(pA, pB, pexhaust, n){
+  r <- rmultinom(1, n, prob = c(pA, pB, pexhaust))
+  return(tibble(nA = r[1, 1], nB = r[2, 1]))
+}
+
+logit_convert <- function(samples){
+  samples %>%
+   mutate(prob_denom_C = exp(b_muA_first_choiceC) + exp(b_muB_first_choiceC) + 1,
+          prob_denom_D = exp(b_muA_first_choiceD) + exp(b_muB_first_choiceD) + 1,
+          pC_to_A = exp(b_muA_first_choiceC)/prob_denom_C,
+          pC_to_B = exp(b_muB_first_choiceC)/prob_denom_C,
+          pC_to_exhaust = 1/prob_denom_C,
+          pD_to_A = exp(b_muA_first_choiceD)/prob_denom_D,
+          pD_to_B = exp(b_muB_first_choiceD)/prob_denom_D,
+          pD_to_exhaust = 1/prob_denom_D)
+}
+
+mnl_predict <- function(samples){
+  samples %>%
+    logit_convert() %>%
+    mutate(C_transfer = pmap(list(pC_to_A, pC_to_B, pC_to_exhaust, initC), multinomial_p),
+          D_transfer = pmap(list(pD_to_A, pD_to_B, pD_to_exhaust, initD), multinomial_p)) %>%
+    unnest(C_transfer) %>%
+    rename(nC_to_A = nA, nC_to_B = nB) %>%
+    unnest(D_transfer) %>%
+    rename(nD_to_A = nA, nD_to_B = nB) %>%
+    mutate(finalA = initA + nC_to_A + nD_to_A,
+           finalB = initB + nC_to_B + nD_to_B,
+           A_diff_B = finalA - finalB,
+           A_winner = A_diff_B > 0)
+}
+
+# Write out the negative log likelihood of a matrix of shares (each row a simplex)
+dirichlet_n_log_lik <- function(alpha, share_matrix) {
+  if(length(alpha) != ncol(share_matrix)) stop("alpha is not the same
+                                               length as the number of choices")
+  out <- NULL
+  for(i in 1:nrow(share_matrix)) {
+    out[i] <- log(MCMCpack::ddirichlet(t(share_matrix[i,]), alpha))
+  }
+  -sum(out)
+}
+
+# Implement Dirichlet regression
+dirichlet_reg <- function(share_matrix) {
+  # This finds values of par to minimize the negative log likelihood function
+  out <- optim(par = rep(1, ncol(share_matrix)), 
+               fn = dirichlet_n_log_lik, 
+               share_matrix = share_matrix,
+               method = "L-BFGS-B", lower = 0.001)
+  out
+}
+
+rprior_samples <- function(n = 1e3, mu = 0, sd = 1){
+  tibble(b_muA_first_choiceC = rnorm(n, sd = sd),
+         b_muB_first_choiceC = rnorm(n, sd = sd),
+         b_muA_first_choiceD = rnorm(n, sd = sd),
+         b_muB_first_choiceD = rnorm(n, sd = sd))
+}
+
+unif_dirichlet_error <- function(n, sd){
+  prob_matrix <- logit_convert(rprior_samples(n = n, sd = sd)) %>%
+    dplyr::select(pC_to_A, pC_to_B, pC_to_exhaust) %>%
+    as.matrix
+  dirichlet_fit <- dirichlet_reg(prob_matrix)
+  return(sum((1 - dirichlet_fit$par)^2))
+}
+
+
+generate_fake_data <- function(transfer_probC, transfer_probD, nC = 100, nD = 100){
+  
+  final_choiceC <- rmultinom(1, nC, prob = transfer_probC)
+  final_choiceD <- rmultinom(1, nD, prob = transfer_probD)
+  
+  final_choiceC_expanded <- rep(c("A", "B", "exhaust"), times = final_choiceC)
+  final_choiceD_expanded <- rep(c("A", "B", "exhaust"), times = final_choiceD)
+  
+  sim_df <- 
+    data.frame(first_choice = rep(c("C", "D"), times = c(nC, nD)), 
+               final_choice = c(final_choiceC_expanded, final_choiceD_expanded),
+               weight = 1) %>%
+    mutate(first_choice = as_factor(first_choice),
+           final_choice = as_factor(final_choice),
+           first_choiceC = ifelse(first_choice == "C", 1, 0),
+           first_choiceD = ifelse(first_choice == "D", 1, 0))
+  
+  return(sim_df)
+}
+
+generate_and_fit <- function(transfer_probC, transfer_probD, nC, nD){
+  
+  sim_df <- generate_fake_data(transfer_probC, transfer_probD, nC, nD)
+  
+  pr <- prior(normal(0, 1.5), dpar = "muA", coef = "first_choiceC") + 
+  prior(normal(0, 1.5), dpar = "muB", coef = "first_choiceC") +
+  prior(normal(0, 1.5), dpar = "muA", coef = "first_choiceD") + 
+  prior(normal(0, 1.5), dpar = "muB", coef = "first_choiceD")
+
+  fit <- brm(formula = final_choice|weights(weight) ~ 0 + first_choiceC + first_choiceD,
+           data = sim_df,
+           family = categorical(refcat = "exhaust"),
+           prior = pr, sample_prior = "no", 
+           chains = 4, iter = 4000,
+           file = glue("posterior_nC{nC}_nD{nD}"))
+  
+  return(fit)
+}
+
+get_ndiv <- function(nC_samples, nD_samples){
+  fit <- read_rds(glue("posterior_nC{nC_samples}_nD{nD_samples}.rds"))
+  ndiv <- sum(subset(nuts_params(fit), Parameter == "divergent__")$Value)
+  return(as.numeric(ndiv))
+}
+
+get_rhat <- function(nC_samples, nD_samples){
+  fit <- read_rds(glue("posterior_nC{nC_samples}_nD{nD_samples}.rds"))
+  as.data.frame(as.list(rhat(fit)))
+}
+
+get_neff <- function(nC_samples, nD_samples){
+  fit <- read_rds(glue("posterior_nC{nC_samples}_nD{nD_samples}.rds"))
+  as.data.frame(as.list(neff_ratio(fit)))
+}
+
+```
+
+## Set true values
+
+##### Set first round count
+```{r}
+initA <- 15e3
+initB <- 14e3
+initC <- 2500
+initD <- 900
+
+(init_count <- data.frame(candidate = c("A", "B", "C", "D"), 
+                          count = c(initA, initB, initC, initD)) %>%
+   adorn_totals())
+```
+
+##### Set transfer probabilities
+```{r}
+actual_pC_to_A <- 1/3
+actual_pC_to_B <- 1/3
+actual_pC_to_exhaust <- 1/3 
+actual_pD_to_A <- 6/10
+actual_pD_to_B <- 3/10
+actual_pD_to_exhaust <- 1/10 
+
+transfer_probC <- c(actual_pC_to_A, actual_pC_to_B, actual_pC_to_exhaust)
+transfer_probD <- c(actual_pD_to_A, actual_pD_to_B, actual_pD_to_exhaust)
+
+(transfer_prob <- data.frame(from = rep(c("C", "D"), each = 3),
+                            to = c("A", "B", "exhaust"), 
+                            prob = c(transfer_probC, transfer_probD)) %>%
+    unite("name", from, to, sep = "_to_", remove = FALSE) %>%
+    mutate(name = glue("p{name}")))
+```
+
+##### Implied final round counts, percents, differences
+
+```{r}
+true_implied <- 
+  data.frame(pC_to_A = rep(actual_pC_to_A, 1e3),
+             pC_to_B = actual_pC_to_B,
+             pC_to_exhaust = actual_pC_to_exhaust,
+             pD_to_A = actual_pD_to_A,
+             pD_to_B = actual_pD_to_B,
+             pD_to_exhaust = actual_pD_to_exhaust) %>%
+  mutate(C_transfer = pmap(list(pC_to_A, pC_to_B, pC_to_exhaust, initC), multinomial_p),
+         D_transfer = pmap(list(pD_to_A, pD_to_B, pD_to_exhaust, initD), multinomial_p)) %>%
+  unnest(C_transfer) %>%
+  rename(nC_to_A = nA, nC_to_B = nB) %>%
+  unnest(D_transfer) %>%
+  rename(nD_to_A = nA, nD_to_B = nB) %>%
+  mutate(finalA = initA + nC_to_A + nD_to_A,
+         finalB = initB + nC_to_B + nD_to_B,
+         A_diff_B = finalA - finalB,
+         A_winner = A_diff_B > 0)
+```
+
+##### Plot: Final round total
+```{r}
+ggplot(true_implied) + 
+  geom_point(aes(x = finalA, y = finalB), alpha = 0.3) + 
+  geom_abline(intercept = 1, linetype = "dashed") + 
+  xlim(initA, initA + initC + initD) + 
+  ylim(initB, initB + initC + initD) + 
+  labs(subtitle = "Distribution of final round votes expected from\ntrue transfer probabilities") + 
+  theme_light()
+```
+
+
+## Simulation 1
+
+### Generate fake data
+
+Generate some fake data that resembles a poll
+```{r}
+sim_df <- generate_fake_data(transfer_probC, transfer_probD, 
+                             nC = 250, nD = 100)
+```
+
+### Simulation-based prior choice
+
+```{r}
+n_prior_samples <- 1e3
+prior_scan <- 
+  data.frame(n = n_prior_samples, sd = seq(1, 2, by = 0.1)) %>%
+  mutate(sse = purrr::map2(n, sd, unif_dirichlet_error)) 
+
+prior_scan %>%
+  mutate(sd = as.numeric(sd),
+         sse = as.numeric(sse)) %>%
+  ggplot(aes(x = sd, y = sse)) + 
+  geom_line() + geom_point() + 
+  theme_light() + 
+  labs(subtitle = "Which prior sd results in a choice distribution most similar\nto a uniform dirichlet?") + 
+  ylab("sum of squared error")
+```
+
+
+### Prior check: Normal(0, 1.5)
+```{r}
+prior_samples<- rprior_samples(n = 4e3, sd = 1.5)
+prior_samples_pred <- mnl_predict(prior_samples)
+```
+
+##### Plot: Prior transfer probabilities
+
+```{r}
+prior_transferC <- 
+  prior_samples_pred %>%
+  ggplot() + 
+  geom_point(aes(x = pC_to_A, y = pC_to_B), alpha = 0.1) + 
+  theme_light()
+
+prior_transferD <-
+  prior_samples_pred %>%
+  ggplot() + 
+  geom_point(aes(x = pD_to_A, y = pD_to_B), alpha = 0.1) + 
+  theme_light()
+
+plot_grid(prior_transferC, prior_transferD, nrow = 1)
+```
+
+```{r}
+prior_samples_pred %>%
+  select(pC_to_A, pC_to_B, pC_to_exhaust, pD_to_A, pD_to_B, pD_to_exhaust) %>%
+  pivot_longer(everything(), names_to = "category", values_to = "prob") %>% 
+  ggplot(aes(y = category, x = prob)) + 
+  stat_halfeye(.width = c(0.95), point_interval = mean_qi) + 
+  xlim(0, 1) + 
+  theme_light()
+```
+
+
+##### Plot: Prior final counts
+
+```{r}
+prior_samples_pred %>%
+  ggplot() + 
+  geom_point(aes(x = finalA, y = finalB), alpha = 0.3) + 
+  geom_abline(slope = 1, linetype = "dashed") + 
+  theme_light() 
+```
+
+##### Plot: Prior final percent
+
+```{r}
+prior_samples_pred %>%
+  mutate(finalA_perc = finalA/(finalA + finalB),
+         finalB_perc = finalB/(finalA + finalB)) %>%
+  ggplot() + 
+  geom_histogram(aes(x = finalA_perc), binwidth = 0.005, fill = "black", color = "white") + 
+  geom_vline(xintercept = 0.50, linetype = "dashed", color = "red") + 
+  theme_light() 
+```
+
+##### Plot: Prior final difference
+
+```{r}
+prior_samples_pred %>%
+  ggplot() + 
+  geom_histogram(aes(x = A_diff_B), binwidth = 50, fill = "black") + 
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") + 
+  theme_light() 
+```
+```{r}
+prior_samples_pred %>%
+  summarise(prob_A_wins = mean(A_winner))
+```
+
+### Fit Posterior - weights = 1
+```{r}
+
+pr <- prior(normal(0, 1.25), dpar = "muA", coef = "first_choiceC") + 
+  prior(normal(0, 1.25), dpar = "muB", coef = "first_choiceC") +
+  prior(normal(0, 1.25), dpar = "muA", coef = "first_choiceD") + 
+  prior(normal(0, 1.25), dpar = "muB", coef = "first_choiceD")
+
+fit_w1 <- brm(formula = final_choice|weights(weight) ~ 0 + first_choiceC + first_choiceD,
+           data = sim_df,
+           family = categorical(refcat = "exhaust"),
+           prior = pr, sample_prior = "no", 
+           chains = 4, iter = 2000,
+           file = "posterior_betterPrior_w1")
+
+post_samples_w1 <- spread_draws(fit_w1, 
+                              b_muA_first_choiceC, b_muB_first_choiceC,
+                              b_muA_first_choiceD, b_muB_first_choiceD)
+post_samples_pred_w1 <- mnl_predict(post_samples_w1)
+posterior_summary(fit_w1)
+
+```
+
+
+##### Convergence check
+```{r}
+mcmc_rhat(rhat(fit_w1)) + yaxis_text(hjust = 0)
+mcmc_neff(neff_ratio(fit_w1)) + yaxis_text(hjust = 0)
+
+ndiv <- sum(subset(nuts_params(fit_w1), Parameter == "divergent__")$Value)
+glue("number of divergences: {ndiv}")
+```
+##### Plot: Posterior log odds
+
+```{r}
+post_logitC <-
+  post_samples_pred_w1 %>%
+  ggplot() + 
+  geom_point(aes(x = b_muA_first_choiceC, y = b_muB_first_choiceC), alpha = 0.2) + 
+  geom_point(aes(x = log(actual_pC_to_A/actual_pC_to_exhaust), y = log(actual_pC_to_B/actual_pC_to_exhaust)), color = "red") + 
+  xlim(-3, 3) +
+  ylim(-3, 3) + 
+  theme_light()
+
+post_logitD <-
+  post_samples_pred_w1 %>%
+  ggplot() + 
+  geom_point(aes(x = b_muA_first_choiceD, y = b_muB_first_choiceD), alpha = 0.2) + 
+  geom_point(aes(x = log(actual_pD_to_A/actual_pD_to_exhaust), y = log(actual_pD_to_B/actual_pD_to_exhaust)), color = "red") + 
+  xlim(-3, 3) +
+  ylim(-3, 3) + 
+  theme_light()
+
+plot_grid(post_logitC, post_logitD, nrow = 1)
+```
+
+```{r}
+
+transfer_logit <-
+  transfer_prob %>% 
+  select(name, prob) %>%
+  pivot_wider(names_from = name, values_from = prob) %>%
+  transmute(logit_C_to_A = log(actual_pC_to_A/actual_pC_to_exhaust),
+            logit_C_to_B = log(actual_pC_to_B/actual_pC_to_exhaust),
+            logit_D_to_A = log(actual_pD_to_A/actual_pD_to_exhaust),
+            logit_D_to_B = log(actual_pD_to_B/actual_pD_to_exhaust)) %>%
+  pivot_longer(everything(), names_to = "category", values_to = "log_odds")
+  
+
+post_samples_pred_w1 %>%
+  select(logit_C_to_A = b_muA_first_choiceC, 
+         logit_C_to_B = b_muB_first_choiceC,
+         logit_D_to_A = b_muA_first_choiceD, 
+         logit_D_to_B = b_muB_first_choiceD) %>%
+  pivot_longer(everything(), names_to = "category", values_to = "log_odds") %>% 
+  ggplot(aes(y = category, x = log_odds)) + 
+  stat_halfeye(.width = c(0.95), point_interval = mean_qi) + 
+  geom_point(data = transfer_logit, aes(y = category, x = log_odds), color = "red", size = 2) + 
+  labs(subtitle = "red dot is true value") + 
+  theme_light()
+```
+
+
+##### Plot: Posterior transfer probabilities
+
+```{r}
+post_transferC <- 
+  post_samples_pred_w1 %>%
+  ggplot() + 
+  geom_point(aes(x = pC_to_A, y = pC_to_B), alpha = 0.1) + 
+  geom_point(aes(x = actual_pC_to_A, y = actual_pC_to_B), color = "red") + 
+  xlim(0,1) + 
+  ylim(0,1) +
+    labs(subtitle = "red dot is true value") + 
+  theme_light()
+
+post_transferD <-
+  post_samples_pred_w1 %>%
+  ggplot() + 
+  geom_point(aes(x = pD_to_A, y = pD_to_B), alpha = 0.1) + 
+  geom_point(aes(x = actual_pD_to_A, y = actual_pD_to_B), color = "red") + 
+  xlim(0,1) + 
+  ylim(0,1) +
+  theme_light()
+
+plot_grid(post_transferC, post_transferD, nrow = 1)
+```
+
+```{r}
+
+post_samples_pred_w1 %>%
+  select(pC_to_A, pC_to_B, pC_to_exhaust, pD_to_A, pD_to_B, pD_to_exhaust) %>%
+  pivot_longer(everything(), names_to = "category", values_to = "prob") %>% 
+  ggplot(aes(y = category, x = prob)) + 
+  stat_halfeye(.width = c(0.95), point_interval = mean_qi) + 
+  geom_point(data = transfer_prob, aes(y = name, x = prob), color = "red", size = 3) + 
+  xlim(0, 1) + 
+    labs(subtitle = "red dot is true value") + 
+  theme_light()
+
+```
+
+
+##### Plot: Posterior final counts
+
+```{r}
+post_samples_pred_w1 %>%
+  ggplot() + 
+  geom_point(aes(x = finalA, y = finalB), alpha = 0.3) + 
+  geom_abline(slope = 1, linetype = "dashed") + 
+  xlim(initA, initA + initC + initD) + 
+  ylim(initB, initB + initC + initD) + 
+  theme_light() 
+```
+
+##### Plot: Posterior final percent
+
+```{r}
+post_samples_pred_w1 %>%
+  mutate(finalA_perc = finalA/(finalA + finalB)) %>%
+  ggplot() + 
+  geom_histogram(aes(x = finalA_perc), binwidth = 0.001, fill = "black", color = "white") + 
+  geom_vline(xintercept = 0.50, linetype = "dashed", color = "red") + 
+  theme_light() 
+```
+
+##### Plot: Posterior final difference
+
+```{r}
+post_samples_pred_w1 %>%
+  ggplot() + 
+  geom_histogram(aes(x = A_diff_B), binwidth = 50, fill = "black", color = "white") + 
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") + 
+  theme_light() 
+```
+
+```{r}
+post_samples_pred_w1 %>%
+  summarise(prob_A_wins = mean(A_winner))
+```
+
+
+## Simulation 2
+
+##### Calculate posteriors
+
+```{r}
+nC_samples <- c(50, 100, 250, 500)
+nD_samples <- c(50, 100, 250, 500)
+
+many_sim_df <- 
+  expand_grid(nC_samples, nD_samples) 
+# generate fits
+for (i in 1:nrow(many_sim_df)){
+  generate_and_fit(transfer_probC, transfer_probD,
+                   nC = as.numeric(many_sim_df[i, "nC_samples"]),
+                   nD = as.numeric(many_sim_df[i, "nD_samples"]))
+}
+```
+
+##### Convergence checks
+
+```{r}
+
+many_sim_df %>%
+  mutate(ndiv = map2_dbl(nC_samples, nD_samples ,get_ndiv)) %>%
+  summarise(ndiv = sum(ndiv))
+
+many_sim_df %>%
+  mutate(rhats = map2(nC_samples, nD_samples ,get_rhat)) %>%
+  unnest(rhats) %>%
+  pivot_longer(-c(nC_samples, nD_samples), names_to = "param", values_to = "rhat") %>%
+  filter(rhat > 1.05)
+
+many_sim_df %>%
+  mutate(neffs = map2(nC_samples, nD_samples ,get_neff)) %>%
+  unnest(neffs) %>%
+  pivot_longer(-c(nC_samples, nD_samples), names_to = "param", values_to = "neff") %>%
+  filter(param != "lp__" & neff < 0.5)
+
+```
+

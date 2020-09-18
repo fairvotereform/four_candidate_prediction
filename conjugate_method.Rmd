@@ -1,0 +1,879 @@
+---
+title: "poll - conjugate form"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 5
+    toc_float: true
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This document contains simulations demonstrating the applicability of two methods (one Bayesian and one non-Bayesian bootstrap) for estimating transfer probabilities for two eliminated candidates.
+
+## Setup 
+
+Load libraries and some useful functions.
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(forcats)
+library(dplyr)
+library(glue)
+library(janitor)
+library(cowplot)
+library(MCMCpack)
+```
+
+```{r}
+generate_fake_data <- function(transfer_probC, transfer_probD, nC = 100, nD = 100){
+  
+  final_choiceC <- rmultinom(1, nC, prob = transfer_probC)
+  final_choiceD <- rmultinom(1, nD, prob = transfer_probD)
+  
+  final_choiceC_expanded <- rep(c("A", "B", "exhaust"), times = final_choiceC)
+  final_choiceD_expanded <- rep(c("A", "B", "exhaust"), times = final_choiceD)
+  
+  sim_df <- 
+    data.frame(first_choice = rep(c("C", "D"), times = c(nC, nD)), 
+               final_choice = c(final_choiceC_expanded, final_choiceD_expanded),
+               weight = 1)  %>%
+    group_by(first_choice, final_choice) %>%
+    summarise(n = sum(weight),
+              .groups = "drop_last") %>%
+    ungroup()
+  
+  return(sim_df)
+}
+
+multinomial_p <- function(pA, pB, pexhaust, n){
+  r <- rmultinom(1, n, prob = c(pA, pB, pexhaust))
+  return(tibble(nA = r[1, 1], nB = r[2, 1]))
+}
+
+```
+
+## Set true values
+
+Pick a set of "true" transfer probabilities to use in simulations. The imagined scenario for these simulations is a four candidate RCV contest (candidates A, B, C, D). We have a poll of voters' first and final choices. Assuming candidates C and D are eliminated, we want to estimate the the probability of their ballots being transferred to the remaining two candidates (A, B) as well as the probability they choose neither and their ballot exhausts. Crucially, we do not only want the maximum likelihood estimate, we want a distribution of estimates so that they can be sampled. Then, given first round counts for each candidate, we can use samples from our inference distribution to convert our estimate in the transfer probabilities into an estimate of the final round count.
+
+```{r}
+actual_pC_to_A <- 1/3
+actual_pC_to_B <- 1/3
+actual_pC_to_exhaust <- 1/3 
+actual_pD_to_A <- 6/10
+actual_pD_to_B <- 3/10
+actual_pD_to_exhaust <- 1/10 
+
+transfer_probC <- c(actual_pC_to_A, actual_pC_to_B, actual_pC_to_exhaust)
+transfer_probD <- c(actual_pD_to_A, actual_pD_to_B, actual_pD_to_exhaust)
+
+(transfer_prob <- data.frame(from = rep(c("C", "D"), each = 3),
+                            to = c("A", "B", "exhaust"), 
+                            prob = c(transfer_probC, transfer_probD)) %>%
+    unite("name", from, to, sep = "_to_", remove = FALSE) %>%
+    mutate(name = glue("p{name}")))
+```
+## Fake data nC = 200, nD = 100
+
+Generate fake data. In this simulation, use relatively large sample sizes for each eliminated candidate. Simulate 200 transferred ballots from candidate C and 100 from candidate D, according to their respective true transfer probabilities.
+
+```{r}
+(sim_df <- generate_fake_data(transfer_probC, transfer_probD, 
+                             nC = 200, nD = 100))
+```
+
+### Method 1 - Bayesian conjugate model
+
+Now given the fake data, the first method for estimating the true transfer probabilities is a Bayesian categorical model.
+
+##### Model description
+
+The data are assumed to be generated from a categorical distribution.
+
+$$
+final\_choice_i \sim {\sf Categorical}(p_{A,i}, p_{B,i}, p_{exhaust,i})
+$$
+
+Treating the first choices as independent variables we can write regression equations for the three parameters in the categorical
+
+$$
+p_A = first\_choice_{C,i} * \alpha_C + (1 - first\_choice_{C,i})  * \alpha_D
+\\
+p_B = first\_choice_{C,i} * \beta_C + (1 - first\_choice_{C,i})  * \beta_D
+\\
+p_A = first\_choice_{C,i} * \gamma_C + (1 - first\_choice_{C,i})  * \gamma_D
+\\\\
+{\sf where } ~ first\_choice_{C,i} = 1 {\sf ~ if ~ the ~ voter ~ picked ~ C ~ first, ~ and ~ 0 ~ otherwise.}
+$$
+In other words, two sets of transfer probabilities are being estimated. One set that governs how ballots transfer from C and another that governs how ballots transfer from D.
+
+Finally, each set of parameters gets a prior. A Dirichlet prior, with hyperparameters (1,1,1), provides a prior distribution that makes all sets of transfer probabilities equally likely.
+
+$$
+(\alpha_C, \beta_C. \gamma_C) \sim {\sf Dirichlet}(1,1,1)
+\\
+(\alpha_D, \beta_D. \gamma_D) \sim {\sf Dirichlet}(1,1,1)
+$$
+With the model described, the posterior distribution can be estimated. Conveniently, the Dirichlet is conjugate to the categorical and so the posterior distribution that results from the combination of a categorical likelihood and Dirichlet prior has an analytical solution and is also Dirichlet. This saves us from MCMC sampling. Random samples can now just be drawn using standard functions.
+
+(https://en.wikipedia.org/wiki/Dirichlet_distribution#Conjugate_to_categorical/multinomial)
+
+
+The posterior distribution is: 
+
+$$
+(\alpha_C, \beta_C. \gamma_C) \sim {\sf Dirichlet}(n_{C\_to\_A} + 1, n_{C\_to\_B} + 1, n_{C\_to\_exhaust} + 1)
+\\
+(\alpha_D, \beta_D. \gamma_D) \sim {\sf Dirichlet}(n_{D\_to\_A} + 1, n_{D\_to\_B} + 1, n_{D\_to\_exhaust} + 1)
+$$
+
+##### Prior
+
+A Dirichlet(1,1,1) prior sets all probability sets as being equally likely.
+
+```{r}
+
+priorC_samples <- 
+  rdirichlet(2e3, c(1,1,1)) %>%
+  data.frame() %>%
+  transmute(pA = X1, pB = X2, pExhaust = X3)
+
+priorD_samples <- 
+  rdirichlet(2e3, c(1,1,1)) %>%
+  data.frame() %>%
+  transmute(pA = X1, pB = X2, pExhaust = X3)
+
+priorC_plot <- 
+  ggplot(priorC_samples) +
+  geom_point(aes(x = pA, y = pB), alpha = 0.3) + 
+  labs(subtitle = "prior transfer probabilities from\ncandidate C") + 
+  theme_light()
+
+priorD_plot <- 
+  ggplot(priorD_samples) +
+  geom_point(aes(x = pA, y = pB), alpha = 0.3) + 
+  labs(subtitle = "prior transfer probabilities from\ncandidate D") + 
+  theme_light()
+
+plot_grid(priorC_plot, priorD_plot, nrow = 1)
+
+```
+
+
+##### Posterior - conjugate
+
+Posterior samples easily drawn from the updated Dirichlet.
+
+```{r}
+
+sim_df_post <-
+  sim_df %>%
+  mutate(posterior_param = n + 1)
+
+postC_params <- 
+  sim_df_post %>%
+  filter(first_choice == "C") %>%
+  pull(posterior_param) 
+
+postD_params <- 
+  sim_df_post %>%
+  filter(first_choice == "D") %>%
+  pull(posterior_param) 
+
+postC_samples <- 
+  rdirichlet(2e3, postC_params) %>%
+  data.frame() %>%
+  transmute(pA = X1, pB = X2, pExhaust = X3)
+
+postD_samples <- 
+  rdirichlet(2e3, postD_params) %>%
+  data.frame() %>%
+  transmute(pA = X1, pB = X2, pExhaust = X3)
+
+postC_summary <-
+  postC_samples %>% 
+  pivot_longer(everything(), names_to = "param", values_to = "value") %>%
+  group_by(param) %>%
+  summarise(q05 = quantile(value, probs = 0.025),
+            q25 = quantile(value, probs = 0.25),
+            mean = mean(value),
+            q75 = quantile(value, probs = 0.75),
+            q95 = quantile(value, probs = 0.975),
+            .groups = "drop_last") 
+
+
+postD_summary <-
+  postD_samples %>% 
+  pivot_longer(everything(), names_to = "param", values_to = "value") %>%
+  group_by(param) %>%
+  summarise(q05 = quantile(value, probs = 0.025),
+            q25 = quantile(value, probs = 0.25),
+            mean = mean(value),
+            q75 = quantile(value, probs = 0.75),
+            q95 = quantile(value, probs = 0.975),
+            .groups = "drop_last") 
+
+post_summary <- 
+  rbind(postC_summary %>% mutate(first_choice = "C"),
+        postD_summary %>% mutate(first_choice = "D")) %>%
+  relocate(first_choice, .before = param)
+
+plot_quanitlesC <- 
+  postC_summary %>%
+  dplyr::select(param, q05, q95) %>%
+  pivot_longer(c(q05, q95), names_to = "quantile") 
+  
+plot_quanitlesD <- 
+  postD_summary %>%
+  dplyr::select(param, q05, q95) %>%
+  pivot_longer(c(q05, q95), names_to = "quantile") 
+
+postC_plot <- 
+  ggplot(postC_samples) +
+  geom_point(aes(x = pA, y = pB), alpha = 0.3) + 
+  geom_point(aes(x = actual_pC_to_A, actual_pC_to_B), color = "red") + 
+  geom_line(data = plot_quanitlesC %>% filter(param == "pA"), 
+            aes(x = value, y = 0), size = 1) + 
+  geom_line(data = plot_quanitlesC %>% filter(param == "pB"),
+            aes(x = 0, y = value), size = 1) +
+  geom_abline(intercept = 1, slope = -1, linetype = "dashed") +
+  labs(subtitle = "post transfer probabilities from\ncandidate C\n(lines indicate 95% intervals)\n(red dot is true value)") + 
+  expand_limits(x = c(0,1), y = c(0,1)) + 
+  theme_light()
+
+postD_plot <- 
+  ggplot(postD_samples) +
+  geom_point(aes(x = pA, y = pB), alpha = 0.3) +
+  geom_point(aes(x = actual_pD_to_A, actual_pD_to_B), color = "red") +
+  geom_line(data = plot_quanitlesD %>% filter(param == "pA"), 
+            aes(x = value, y = 0), size = 1) + 
+  geom_line(data = plot_quanitlesD %>% filter(param == "pB"),
+            aes(x = 0, y = value), size = 1) +
+  geom_abline(intercept = 1, slope = -1, linetype = "dashed") +
+  labs(subtitle = "post transfer probabilities from\ncandidate D\n(lines indicate 95% intervals)\n(red dot is true value)") + 
+  expand_limits(x = c(0,1), y = c(0,1)) + 
+  theme_light()
+
+plot_grid(postC_plot, postD_plot, nrow = 1)
+
+```
+
+### Method 2 - Bootstrap
+
+Alternatively, a distribution of bootstrap estimates for the transfer probabilities can be calculated. This is done separately for ballots from C and D.
+
+```{r}
+
+ndataC <- sum(sim_df %>% filter(first_choice == "C") %>% pull(n))
+ndataD <- sum(sim_df %>% filter(first_choice == "D") %>% pull(n))
+
+prob_data <-
+  sim_df %>%
+  group_by(first_choice) %>%
+  mutate(perc = n/sum(n)) %>%
+  pull(perc)
+
+boots <- 
+  t(rbind(rmultinom(2e3, ndataC, prob = prob_data[1:3]),
+          rmultinom(2e3, ndataD, prob = prob_data[4:6]))) %>% 
+  data.frame() %>%
+  transmute(sim = row_number(),
+         pC_to_A = X1, 
+         pC_to_B = X2,
+         pC_to_exhaust = X3,
+         pD_to_A = X4,
+         pD_to_B = X5,
+         pD_to_exhaust = X6) %>%
+  pivot_longer(-sim, names_to = "param") %>%
+  separate(param, sep = "_to_", into = c("first_choice", "final_choice") , remove = FALSE) %>%
+  group_by(sim, first_choice) %>%
+  mutate(perc = value/sum(value)) %>%
+  ungroup() %>%
+  pivot_wider(id_cols = sim, names_from = param, values_from = perc)
+
+boot_summary <-
+  boots %>% 
+  pivot_longer(-sim, names_to = "param", values_to = "value") %>%
+  group_by(param) %>%
+  summarise(q05 = quantile(value, probs = 0.025),
+            q25 = quantile(value, probs = 0.25),
+            mean = mean(value),
+            q75 = quantile(value, probs = 0.75),
+            q95 = quantile(value, probs = 0.975),
+            .groups = "drop_last") 
+
+plot_quanitles <- 
+  boot_summary %>%
+  dplyr::select(param, q05, q95) %>%
+  pivot_longer(c(q05, q95), names_to = "quantile") 
+
+bootC_plot <-
+  ggplot(boots) + 
+  geom_point(aes(x = pC_to_A, y = pC_to_B), alpha = 0.3, color = "orange") + 
+  geom_point(aes(x = actual_pC_to_A, actual_pC_to_B), color = "red") +
+  geom_line(data = plot_quanitles %>% filter(param == "pC_to_A"), 
+            aes(x = value, y = 0), size = 1, color = "orange") + 
+  geom_line(data = plot_quanitles %>% filter(param == "pC_to_B"),
+            aes(x = 0, y = value), size = 1, color = "orange") +
+  geom_abline(intercept = 1, slope = -1, linetype = "dashed") +
+  labs(subtitle = "bootstrap transfer probabilities\nfrom candidate C\n(lines indicate 95% intervals)\n(red dot is true value)") +
+  expand_limits(x = c(0,1), y = c(0,1)) + 
+  theme_light()
+
+bootD_plot <-
+  ggplot(boots) + 
+  geom_point(aes(x = pD_to_A, y = pD_to_B), alpha = 0.3, color = "orange") + 
+  geom_point(aes(x = actual_pD_to_A, actual_pD_to_B), color = "red") + 
+  geom_line(data = plot_quanitles %>% filter(param == "pD_to_A"), 
+            aes(x = value, y = 0), size = 1, color = "orange") + 
+  geom_line(data = plot_quanitles %>% filter(param == "pD_to_B"),
+            aes(x = 0, y = value), size = 1, color = "orange") +
+  geom_abline(intercept = 1, slope = -1, linetype = "dashed") +
+  labs(subtitle = "bootstrap transfer probabilities\nfrom candidate D\n(lines indicate 95% intervals)\n(red dot is true value)") +
+  expand_limits(x = c(0,1), y = c(0,1)) + 
+  theme_light()  
+
+plot_grid(bootC_plot, bootD_plot, nrow = 1)
+```
+
+### Both methods
+
+Plotting the distributions on top of each other demonstrates that, in this case, they produced nearly identical estimates.
+
+```{r}
+
+plotC <-
+  ggplot() + 
+  geom_point(data = boots, aes(x = pC_to_A, y = pC_to_B), alpha = 0.1, color = "orange") + 
+  geom_point(data = postC_samples, aes(x = pA, y = pB), alpha = 0.1) + 
+  geom_point(aes(x = actual_pC_to_A, actual_pC_to_B), color = "red") +
+  geom_line(data = plot_quanitlesC %>% filter(param == "pA"), 
+            aes(x = value, y = 0.01), size = 1) + 
+  geom_line(data = plot_quanitlesC %>% filter(param == "pB"),
+            aes(x = 0.01, y = value), size = 1) +
+  geom_line(data = plot_quanitles %>% filter(param == "pC_to_A"), 
+            aes(x = value, y = 0), size = 1, color = "orange") + 
+  geom_line(data = plot_quanitles %>% filter(param == "pC_to_B"),
+            aes(x = 0, y = value), size = 1, color = "orange") +
+  geom_abline(intercept = 1, slope = -1, linetype = "dashed") +
+  labs(subtitle = "bootstrap transfer probabilities\nfrom candidate C\n(lines indicate 95% intervals)\n(red dot is true value)\n(orange = bootstrap, black = bayesian)") +
+  expand_limits(x = c(0,1), y = c(0,1)) + 
+  theme_light() + 
+  theme(plot.subtitle = element_text(size=9))
+
+
+plotD <-
+  ggplot() + 
+  geom_point(data = boots, aes(x = pD_to_A, y = pD_to_B), alpha = 0.1, color = "orange") +
+  geom_point(data = postD_samples, aes(x = pA, y = pB), alpha = 0.1) + 
+  geom_point(aes(x = actual_pD_to_A, actual_pD_to_B), color = "red") + 
+  geom_line(data = plot_quanitlesD %>% filter(param == "pA"), 
+            aes(x = value, y = 0.01), size = 1) + 
+  geom_line(data = plot_quanitlesD %>% filter(param == "pB"),
+            aes(x = 0.01, y = value), size = 1) +
+  geom_line(data = plot_quanitles %>% filter(param == "pD_to_A"), 
+            aes(x = value, y = 0), size = 1, color = "orange") + 
+  geom_line(data = plot_quanitles %>% filter(param == "pD_to_B"),
+            aes(x = 0, y = value), size = 1, color = "orange") +
+  geom_abline(intercept = 1, slope = -1, linetype = "dashed") +
+  labs(subtitle = "bootstrap transfer probabilities\nfrom candidate D\n(lines indicate 95% intervals)\n(red dot is true value)\n(orange = bootstrap, black = bayesian)") +
+  expand_limits(x = c(0,1), y = c(0,1)) + 
+  theme_light() + 
+  theme(plot.subtitle = element_text(size=9))
+
+plot_grid(plotC, plotD, nrow = 1)
+
+```
+
+## Fake data nC = 75, nD = 25
+
+Now try both methods again but with smaller sample sizes. 75 ballots from C and 25 from D.
+
+```{r}
+sim_df <- generate_fake_data(transfer_probC, transfer_probD, 
+                             nC = 75, nD = 25)
+```
+
+### Method 1 - Bayesian conjugate model
+
+##### Posterior - conjugate
+
+```{r}
+
+sim_df_post <-
+  sim_df %>%
+  mutate(posterior_param = n + 1)
+
+postC_params <- 
+  sim_df_post %>%
+  filter(first_choice == "C") %>%
+  pull(posterior_param) 
+
+postD_params <- 
+  sim_df_post %>%
+  filter(first_choice == "D") %>%
+  pull(posterior_param) 
+
+postC_samples <- 
+  rdirichlet(2e3, postC_params) %>%
+  data.frame() %>%
+  transmute(pA = X1, pB = X2, pExhaust = X3)
+
+postD_samples <- 
+  rdirichlet(2e3, postD_params) %>%
+  data.frame() %>%
+  transmute(pA = X1, pB = X2, pExhaust = X3)
+
+postC_summary <-
+  postC_samples %>% 
+  pivot_longer(everything(), names_to = "param", values_to = "value") %>%
+  group_by(param) %>%
+  summarise(q05 = quantile(value, probs = 0.05),
+            q25 = quantile(value, probs = 0.25),
+            mean = mean(value),
+            q75 = quantile(value, probs = 0.75),
+            q95 = quantile(value, probs = 0.95),
+            .groups = "drop_last") 
+
+
+postD_summary <-
+  postD_samples %>% 
+  pivot_longer(everything(), names_to = "param", values_to = "value") %>%
+  group_by(param) %>%
+  summarise(q05 = quantile(value, probs = 0.05),
+            q25 = quantile(value, probs = 0.25),
+            mean = mean(value),
+            q75 = quantile(value, probs = 0.75),
+            q95 = quantile(value, probs = 0.95),
+            .groups = "drop_last") 
+
+post_summary <- 
+  rbind(postC_summary %>% mutate(first_choice = "C"),
+        postD_summary %>% mutate(first_choice = "D")) %>%
+  relocate(first_choice, .before = param)
+
+plot_quanitlesC <- 
+  postC_summary %>%
+  dplyr::select(param, q05, q95) %>%
+  pivot_longer(c(q05, q95), names_to = "quantile") 
+  
+plot_quanitlesD <- 
+  postD_summary %>%
+  dplyr::select(param, q05, q95) %>%
+  pivot_longer(c(q05, q95), names_to = "quantile") 
+
+postC_plot <- 
+  ggplot(postC_samples) +
+  geom_point(aes(x = pA, y = pB), alpha = 0.3) + 
+  geom_point(aes(x = actual_pC_to_A, actual_pC_to_B), color = "red") + 
+  geom_line(data = plot_quanitlesC %>% filter(param == "pA"), 
+            aes(x = value, y = 0), size = 1) + 
+  geom_line(data = plot_quanitlesC %>% filter(param == "pB"),
+            aes(x = 0, y = value), size = 1) +
+  geom_abline(intercept = 1, slope = -1, linetype = "dashed") +
+  labs(subtitle = "post transfer probabilities from\ncandidate C") + 
+  expand_limits(x = c(0,1), y = c(0,1)) + 
+  theme_light()
+
+postD_plot <- 
+  ggplot(postD_samples) +
+  geom_point(aes(x = pA, y = pB), alpha = 0.3) +
+  geom_point(aes(x = actual_pD_to_A, actual_pD_to_B), color = "red") +
+  geom_line(data = plot_quanitlesD %>% filter(param == "pA"), 
+            aes(x = value, y = 0), size = 1) + 
+  geom_line(data = plot_quanitlesD %>% filter(param == "pB"),
+            aes(x = 0, y = value), size = 1) +
+  geom_abline(intercept = 1, slope = -1, linetype = "dashed") +
+  labs(subtitle = "post transfer probabilities from\ncandidate D") + 
+  expand_limits(x = c(0,1), y = c(0,1)) + 
+  theme_light()
+
+plot_grid(postC_plot, postD_plot, nrow = 1)
+
+```
+
+### Method 2 - Bootstrap
+
+```{r}
+
+ndataC <- sum(sim_df %>% filter(first_choice == "C") %>% pull(n))
+ndataD <- sum(sim_df %>% filter(first_choice == "D") %>% pull(n))
+
+prob_data <-
+  sim_df %>%
+  group_by(first_choice) %>%
+  mutate(perc = n/sum(n)) %>%
+  pull(perc)
+
+boots <- 
+  t(rbind(rmultinom(2e3, ndataC, prob = prob_data[1:3]),
+          rmultinom(2e3, ndataD, prob = prob_data[4:6]))) %>% 
+  data.frame() %>%
+  transmute(sim = row_number(),
+         pC_to_A = X1, 
+         pC_to_B = X2,
+         pC_to_exhaust = X3,
+         pD_to_A = X4,
+         pD_to_B = X5,
+         pD_to_exhaust = X6) %>%
+  pivot_longer(-sim, names_to = "param") %>%
+  separate(param, sep = "_to_", into = c("first_choice", "final_choice") , remove = FALSE) %>%
+  group_by(sim, first_choice) %>%
+  mutate(perc = value/sum(value)) %>%
+  ungroup() %>%
+  pivot_wider(id_cols = sim, names_from = param, values_from = perc)
+
+boot_summary <-
+  boots %>% 
+  pivot_longer(-sim, names_to = "param", values_to = "value") %>%
+  group_by(param) %>%
+  summarise(q05 = quantile(value, probs = 0.05),
+            q25 = quantile(value, probs = 0.25),
+            mean = mean(value),
+            q75 = quantile(value, probs = 0.75),
+            q95 = quantile(value, probs = 0.95),
+            .groups = "drop_last") 
+
+plot_quanitles <- 
+  boot_summary %>%
+  dplyr::select(param, q05, q95) %>%
+  pivot_longer(c(q05, q95), names_to = "quantile") 
+
+bootC_plot <-
+  ggplot(boots) + 
+  geom_point(aes(x = pC_to_A, y = pC_to_B), alpha = 0.3, color = "orange") + 
+  geom_point(aes(x = actual_pC_to_A, actual_pC_to_B), color = "red") +
+  geom_line(data = plot_quanitles %>% filter(param == "pC_to_A"), 
+            aes(x = value, y = 0), size = 1, color = "orange") + 
+  geom_line(data = plot_quanitles %>% filter(param == "pC_to_B"),
+            aes(x = 0, y = value), size = 1, color = "orange") +
+  geom_abline(intercept = 1, slope = -1, linetype = "dashed") +
+  labs(subtitle = "bootstrap transfer probabilities\nfrom candidate C") +
+  expand_limits(x = c(0,1), y = c(0,1)) + 
+  theme_light()
+
+bootD_plot <-
+  ggplot(boots) + 
+  geom_point(aes(x = pD_to_A, y = pD_to_B), alpha = 0.3, color = "orange") + 
+  geom_point(aes(x = actual_pD_to_A, actual_pD_to_B), color = "red") + 
+  geom_line(data = plot_quanitles %>% filter(param == "pD_to_A"), 
+            aes(x = value, y = 0), size = 1, color = "orange") + 
+  geom_line(data = plot_quanitles %>% filter(param == "pD_to_B"),
+            aes(x = 0, y = value), size = 1, color = "orange") +
+  geom_abline(intercept = 1, slope = -1, linetype = "dashed") +
+  labs(subtitle = "bootstrap transfer probabilities\nfrom candidate D") +
+  expand_limits(x = c(0,1), y = c(0,1)) + 
+  theme_light()  
+
+plot_grid(bootC_plot, bootD_plot, nrow = 1)
+```
+
+With smaller sample sizes the bootstrap distribution of estimates becomes more discretized.
+
+### Both methods
+
+```{r}
+
+plotC <-
+  ggplot() + 
+  geom_point(data = boots, aes(x = pC_to_A, y = pC_to_B), alpha = 0.1, color = "orange") + 
+  geom_point(data = postC_samples, aes(x = pA, y = pB), alpha = 0.1) + 
+  geom_point(aes(x = actual_pC_to_A, actual_pC_to_B), color = "red") +
+  geom_line(data = plot_quanitlesC %>% filter(param == "pA"), 
+            aes(x = value, y = 0.01), size = 1) + 
+  geom_line(data = plot_quanitlesC %>% filter(param == "pB"),
+            aes(x = 0.01, y = value), size = 1) +
+  geom_line(data = plot_quanitles %>% filter(param == "pC_to_A"), 
+            aes(x = value, y = 0), size = 1, color = "orange") + 
+  geom_line(data = plot_quanitles %>% filter(param == "pC_to_B"),
+            aes(x = 0, y = value), size = 1, color = "orange") +
+  geom_abline(intercept = 1, slope = -1, linetype = "dashed") +
+  labs(subtitle = "bootstrap transfer probabilities\nfrom candidate C") +
+  expand_limits(x = c(0,1), y = c(0,1)) + 
+  theme_light()
+
+plotD <-
+  ggplot() + 
+  geom_point(data = boots, aes(x = pD_to_A, y = pD_to_B), alpha = 0.1, color = "orange") +
+  geom_point(data = postD_samples, aes(x = pA, y = pB), alpha = 0.1) + 
+  geom_point(aes(x = actual_pD_to_A, actual_pD_to_B), color = "red") + 
+  geom_line(data = plot_quanitlesD %>% filter(param == "pA"), 
+            aes(x = value, y = 0.01), size = 1) + 
+  geom_line(data = plot_quanitlesD %>% filter(param == "pB"),
+            aes(x = 0.01, y = value), size = 1) +
+  geom_line(data = plot_quanitles %>% filter(param == "pD_to_A"), 
+            aes(x = value, y = 0), size = 1, color = "orange") + 
+  geom_line(data = plot_quanitles %>% filter(param == "pD_to_B"),
+            aes(x = 0, y = value), size = 1, color = "orange") +
+  geom_abline(intercept = 1, slope = -1, linetype = "dashed") +
+  labs(subtitle = "bootstrap transfer probabilities\nfrom candidate D") +
+  expand_limits(x = c(0,1), y = c(0,1)) + 
+  theme_light()
+
+plot_grid(plotC, plotD, nrow = 1)
+
+```
+
+## Frequency properties of Bayesian vs bootstrap
+
+Lastly, do a quick check on the frequency properties of the Bayesian and the bootstrap method. Using a variety of sample sizes, see how the coverage probability and width of the 95%-intervals generated with each method changes.
+
+##### Simulate
+
+Run simulations.
+
+```{r message=FALSE}
+
+multinomial_draw <- function(pA, pB, pexhaust, n){
+  r <- rmultinom(1, n, prob = c(pA, pB, pexhaust))
+  return(tibble(nA = r[1, 1], nB = r[2, 1], nExhaust = r[3, 1]))
+}
+
+summarize_posterior <- function(paramA, paramB, paramExhaust){
+  
+  rdirichlet(1e3, c(paramA, paramB, paramExhaust)) %>%
+    data.frame() %>%
+    rename(pA = X1, pB = X2, pExhaust = X3) %>%
+    pivot_longer(everything(), names_to = "bayes_param", values_to = "value") %>%
+    group_by(bayes_param) %>%
+    summarise(bayes_q05 = quantile(value, probs = 0.025),
+              bayes_q25 = quantile(value, probs = 0.25),
+              bayes_mean = mean(value),
+              bayes_q75 = quantile(value, probs = 0.75),
+              bayes_q95 = quantile(value, probs = 0.975),
+              .groups = "drop_last") %>%
+    pivot_wider(names_from = bayes_param, 
+                values_from =
+                  c(bayes_q05,bayes_q25,bayes_mean,bayes_q75,bayes_q95),
+                names_glue = "{bayes_param}_{.value}")
+}
+
+summarize_booststrap <- function(nA, nB, nExhaust){
+  
+  totalN <- nA + nB + nExhaust
+  boot_pA <- nA/totalN
+  boot_pB <- nB/totalN
+  boot_pExhaust <- nExhaust/totalN
+
+  rmultinom(1e3, totalN, prob = c(boot_pA, boot_pB, boot_pExhaust)) %>%
+    t() %>%
+    data.frame() %>%
+    transmute(sim = row_number(),
+           pA = X1/totalN,
+           pB = X2/totalN,
+           pExhaust = X3/totalN,
+           ) %>%
+  pivot_longer(-sim, names_to = "boot_param", values_to = "value") %>%
+  group_by(boot_param) %>%
+  summarise(boot_q05 = quantile(value, probs = 0.025),
+            boot_q25 = quantile(value, probs = 0.25),
+            boot_mean = mean(value),
+            boot_q75 = quantile(value, probs = 0.75),
+            boot_q95 = quantile(value, probs = 0.975),
+            .groups = "drop_last") %>%
+  pivot_wider(names_from = boot_param, 
+              values_from =
+                c(boot_q05,boot_q25,boot_mean,boot_q75,boot_q95),
+              names_glue = "{boot_param}_{.value}")
+}
+
+calc_estimates <- function(n){
+  
+  print(glue("data sample size = {n}"))
+  
+  rdirichlet(500, c(1,1,1)) %>%
+  data.frame() %>%
+  rename(pA = X1, pB = X2, pExhaust = X3) %>%
+  mutate(
+    sim_num = row_number(),
+    n = n,
+    sample_data = purrr::pmap(
+      .l = list(pA = pA, pB = pB, pexhaust = pExhaust, n = n),
+      .f = multinomial_draw)) %>%
+  unnest(sample_data) %>%
+  mutate(
+    sim = row_number(),
+    postParamA = nA + 1,
+    postParamB = nB + 1,
+    postParamExhaust = nExhaust + 1,
+    postSummary = purrr::pmap(
+      .l = list(paramA = postParamA, 
+                paramB = postParamB,
+                paramExhaust = postParamExhaust),
+      .f = summarize_posterior),
+    bootSummary = purrr::pmap(
+      .l = list(nA = nA, 
+                nB = nB,
+                nExhaust = nExhaust),
+      .f = summarize_booststrap)) %>%
+    unnest(c(postSummary, bootSummary)) %>%
+    transmute(
+      bayes_pA_q95_width = pA_bayes_q95 - pA_bayes_q05,
+      boot_pA_q95_width = pA_boot_q95 - pA_boot_q05,
+      bayes_pB_q95_width = pB_bayes_q95 - pB_bayes_q05,
+      boot_pB_q95_width = pB_boot_q95 - pB_boot_q05,
+      bayes_pExhaust_q95_width = pExhaust_bayes_q95 - pExhaust_bayes_q05,
+      boot_pExhaust_q95_width = pExhaust_boot_q95 - pExhaust_boot_q05,
+      bayes_capture_pA_q95 = pA <= pA_bayes_q95 & pA >= pA_bayes_q05,
+      bayes_capture_pB_q95 = pB <= pB_bayes_q95 & pB >= pB_bayes_q05,
+      bayes_capture_pExhaust_q95 = 
+        pExhaust <= pExhaust_bayes_q95 & pExhaust >= pExhaust_bayes_q05,
+      boot_capture_pA_q95 = pA <= pA_boot_q95 & pA >= pA_boot_q05,
+      boot_capture_pB_q95 = pB <= pB_boot_q95 & pB >= pB_boot_q05,
+      boot_capture_pExhaust_q95 = 
+        pExhaust <= pExhaust_boot_q95 & pExhaust >= pExhaust_boot_q05
+      ) 
+}
+
+resim <- FALSE
+if (resim){
+  sim_df <- 
+    data.frame(n = c(10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 250, 500, 750, 1000)) %>%
+    mutate(sims = purrr::map(n, calc_estimates)) %>%
+    unnest(sims)
+    
+  write_csv(sim_df, "frequentist_comparison.csv")
+}
+  
+sim_df <- read_csv("frequentist_comparison.csv")
+```
+
+##### Plot: 95%-Interval capture probability
+```{r}
+
+capture_summary <-
+  sim_df %>% 
+  group_by(n) %>%
+  summarise(bayes_capture_pA = mean(bayes_capture_pA_q95),
+            bayes_capture_pB = mean(bayes_capture_pB_q95),
+            bayes_capture_pExhaust = mean(bayes_capture_pExhaust_q95),
+            boot_capture_pA = mean(boot_capture_pA_q95),
+            boot_capture_pB = mean(boot_capture_pB_q95),
+            boot_capture_pExhaust = mean(boot_capture_pExhaust_q95),
+            .groups = "drop_last") %>%
+  pivot_longer(-n, names_to = c("method", "param"), names_sep = "_capture_")
+
+capture_pA_plot <- 
+  capture_summary %>%
+  filter(param == "pA") %>%
+  ggplot() + 
+  geom_line(aes(x = n, y = value, color = method)) + 
+  geom_point(aes(x = n, y = value, color = method)) + 
+  labs(subtitle = "pA: capture probability for 95%-interval estimates") + 
+  theme_light()
+
+capture_pB_plot <- 
+  capture_summary %>%
+  filter(param == "pB") %>%
+  ggplot() + 
+  geom_line(aes(x = n, y = value, color = method)) + 
+  geom_point(aes(x = n, y = value, color = method)) + 
+  labs(subtitle = "pB: capture probability for 95%-interval estimates") + 
+  theme_light()
+
+capture_pExhaust_plot <- 
+  capture_summary %>%
+  filter(param == "pExhaust") %>%
+  ggplot() + 
+  geom_line(aes(x = n, y = value, color = method)) + 
+  geom_point(aes(x = n, y = value, color = method)) + 
+  labs(subtitle = "pExhaust: capture probability for 95%-interval estimates") + 
+  theme_light()
+
+plot_grid(capture_pA_plot, capture_pB_plot, capture_pExhaust_plot, ncol = 1)
+  
+```
+
+Not so surprising. The bootstrap method does not produce 95%-intervals that capture the true parameters 95% of the time when the sample size is too small. Bayesian intervals maintain good coverage across sample sizes. 
+
+##### Plot: Interval width
+```{r}
+
+interval_width_summary <-
+  sim_df %>% 
+  group_by(n) %>%
+  summarise(bayes_width_pA_mean = mean(bayes_pA_q95_width),
+            bayes_width_pB_mean = mean(bayes_pB_q95_width),
+            bayes_width_pExhaust_mean = mean(bayes_pExhaust_q95_width),
+            boot_width_pA_mean = mean(boot_pA_q95_width),
+            boot_width_pB_mean = mean(boot_pB_q95_width),
+            boot_width_pExhaust_mean = mean(boot_pExhaust_q95_width),
+            bayes_width_pA_sd = sd(bayes_pA_q95_width),
+            bayes_width_pB_sd = sd(bayes_pB_q95_width),
+            bayes_width_pExhaust_sd = sd(bayes_pExhaust_q95_width),
+            boot_width_pA_sd = sd(boot_pA_q95_width),
+            boot_width_pB_sd = sd(boot_pB_q95_width),
+            boot_width_pExhaust_sd = sd(boot_pExhaust_q95_width),
+            .groups = "drop_last") %>%
+  pivot_longer(-n, names_to = c("method", NA, "param", "stat"), names_sep = "_") %>%
+  pivot_wider(c(n, method, param), names_from = stat)
+
+width_pA_plot <- 
+  interval_width_summary %>%
+  filter(param == "pA") %>%
+  ggplot(aes(x = n, y = mean, color = method)) + 
+  geom_ribbon(aes(ymin = mean - sd, ymax = mean + sd, fill = method), alpha = 0.2) + 
+  geom_line() + 
+  geom_point() + 
+  labs(subtitle = "pA: average 95%-interval width") + 
+  ylab("width") + 
+  expand_limits(y = 0) +
+  theme_light()
+
+width_pB_plot <- 
+  interval_width_summary %>%
+  filter(param == "pB") %>%
+  ggplot(aes(x = n, y = mean, color = method)) + 
+  geom_ribbon(aes(ymin = mean - sd, ymax = mean + sd, fill = method), alpha = 0.2) + 
+  geom_line() + 
+  geom_point() + 
+  labs(subtitle = "pB: average 95%-interval width") + 
+  ylab("width") + 
+  expand_limits(y = 0) +
+  theme_light()
+
+width_pExhaust_plot <- 
+  interval_width_summary %>%
+  filter(param == "pExhaust") %>%
+  ggplot(aes(x = n, y = mean, color = method)) + 
+  geom_ribbon(aes(ymin = mean - sd, ymax = mean + sd, fill = method), alpha = 0.2) + 
+  geom_line() + 
+  geom_point() + 
+  labs(subtitle = "pExhaust: average 95%-interval width") +
+  ylab("width") + 
+  expand_limits(y = 0) +
+  theme_light()
+
+plot_grid(width_pA_plot, width_pB_plot, width_pExhaust_plot, ncol = 1)
+  
+```
+
+Mostly similar. Bootstrap intervals are much wider with small sample sizes. This makes sense since the bootstrap method doesn't work with sample sizes that small.
+
+```{r eval=FALSE, include=FALSE}
+
+# double check that small sample sizes also don't work to produce 
+# accurate confidence intervals on a simpler normal distribution example
+
+bootstrap_capture <- function(n){
+  fake_data <- rnorm(n)
+  boot_dist <- replicate(1e3, mean(sample(fake_data, n, replace = TRUE)))
+  lower_q <- quantile(boot_dist, probs = 0.025) 
+  upper_q <- quantile(boot_dist, probs = 0.975)
+  return(lower_q <= 0 && upper_q >= 0)
+}
+
+capture_prob <- function(n){
+  mean(replicate(1e3, bootstrap_capture(n)))
+}
+
+norm_sim <- 
+  data.frame(n = seq(5, 50, by = 5)) %>%
+  mutate(capture_prob = purrr::map_dbl(n, capture_prob)) 
+
+```
+
